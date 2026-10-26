@@ -31,6 +31,9 @@ struct Cli {
     serial: String,
 }
 
+/// Consecutive connects the device ignored; a dead P2P session shows up this way.
+static CONNECT_FAILS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 #[tokio::main]
 async fn main() {
     let args = Cli::parse();
@@ -137,11 +140,16 @@ async fn main() {
             );
             if !ok {
                 println!("Realm {:08x}: device did not accept connection", realm_id);
+                if CONNECT_FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 >= 2 {
+                    println!("P2P session unusable; exiting so the supervisor reconnects");
+                    std::process::exit(1);
+                }
                 channels3.lock().unwrap().remove(&realm_id);
                 conn_channels3.lock().unwrap().remove(&realm_id);
                 return;
             }
 
+            CONNECT_FAILS.store(0, std::sync::atomic::Ordering::Relaxed);
             let (reader, writer) = client.into_split();
             tokio::spawn(process_writer(writer, rx));
             process_reader(reader, realm_id, dh_tx).await;
