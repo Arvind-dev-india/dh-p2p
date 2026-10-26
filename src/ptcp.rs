@@ -298,27 +298,28 @@ pub trait PTCP {
 #[async_trait]
 impl PTCP for UdpSocket {
     async fn ptcp_request(&self, packet: PTCPPacket) {
-        println!(">>> {}", self.peer_addr().unwrap());
-        println!("{:?}", packet);
-        packet.try_print_data();
-        println!("---");
-
         let packet = packet.serialize();
-        self.send(&packet).await.unwrap();
+        static SEND_ERRORS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        match self.send(&packet).await {
+            Ok(_) => SEND_ERRORS.store(0, std::sync::atomic::Ordering::Relaxed),
+            Err(e) => {
+                let n = SEND_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                eprintln!("ptcp send error {}: {}", n, e);
+                if n >= 5 {
+                    eprintln!("P2P session lost; exiting so the supervisor reconnects");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 
     async fn ptcp_read(&self) -> PTCPPacket {
-        println!("### {}", self.peer_addr().unwrap());
-
         let mut buf = [0u8; 4096];
-        let n = self.recv(&mut buf).await.unwrap();
-
-        println!("<<< {}", self.peer_addr().unwrap());
-        let packet = PTCPPacket::parse(&buf[0..n]);
-        println!("{:?}", packet);
-        packet.try_print_data();
-        println!("---");
-
-        packet
+        loop {
+            match self.recv(&mut buf).await {
+                Ok(n) => return PTCPPacket::parse(&buf[0..n]),
+                Err(e) => eprintln!("ptcp recv error (ignored): {}", e),
+            }
+        }
     }
 }
