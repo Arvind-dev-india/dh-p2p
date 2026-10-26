@@ -65,7 +65,7 @@ async fn main() {
     let (dh_tx, dh_rx) = mpsc::channel::<PTCPEvent>(128);
     let session = Arc::new(Mutex::new(session));
 
-    let channels = Arc::new(Mutex::new(HashMap::<u32, mpsc::Sender<Vec<u8>>>::new()));
+    let channels = Arc::new(Mutex::new(HashMap::<u32, mpsc::UnboundedSender<Vec<u8>>>::new()));
     let conn_channels = Arc::new(Mutex::new(HashMap::<u32, oneshot::Sender<bool>>::new()));
 
     println!("PTCP session established");
@@ -115,7 +115,7 @@ async fn main() {
         println!("Accepted connection from {}", addr);
 
         // Create a channel for the client
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (conn_tx, conn_rx) = oneshot::channel::<bool>();
         let dh_tx = dh_tx.clone();
 
@@ -125,17 +125,27 @@ async fn main() {
         channels2.lock().unwrap().insert(realm_id, tx);
         conn_channels2.lock().unwrap().insert(realm_id, conn_tx);
 
-        dh_tx.send(PTCPEvent::Connect(realm_id)).await.unwrap();
-        conn_rx.await.unwrap();
-
-        let (reader, writer) = client.into_split();
-
+        let channels3 = channels2.clone();
+        let conn_channels3 = conn_channels2.clone();
         tokio::spawn(async move {
+            if dh_tx.send(PTCPEvent::Connect(realm_id)).await.is_err() {
+                return;
+            }
+            let ok = matches!(
+                tokio::time::timeout(tokio::time::Duration::from_secs(15), conn_rx).await,
+                Ok(Ok(true))
+            );
+            if !ok {
+                println!("Realm {:08x}: device did not accept connection", realm_id);
+                channels3.lock().unwrap().remove(&realm_id);
+                conn_channels3.lock().unwrap().remove(&realm_id);
+                return;
+            }
+
+            let (reader, writer) = client.into_split();
+            tokio::spawn(process_writer(writer, rx));
             process_reader(reader, realm_id, dh_tx).await;
-        });
-
-        tokio::spawn(async move {
-            process_writer(writer, rx).await;
+            channels3.lock().unwrap().remove(&realm_id);
         });
     }
 }

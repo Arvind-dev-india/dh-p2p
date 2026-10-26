@@ -15,10 +15,9 @@ use crate::ptcp::{PTCPBody, PTCPEvent, PTCPPayload, PTCPSession, PTCP};
  */
 pub async fn process_writer(
     mut writer: tokio::net::tcp::OwnedWriteHalf,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
 ) {
-    loop {
-        let data = rx.recv().await.unwrap();
+    while let Some(data) = rx.recv().await {
         if writer.write_all(&data).await.is_err() {
             println!("Writer: Socket closed by peer.");
             break;
@@ -109,7 +108,7 @@ pub async fn dh_writer(
 pub async fn dh_reader(
     session: Arc<Mutex<PTCPSession>>,
     socket: Arc<UdpSocket>,
-    channels: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+    channels: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>>,
     conn_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
 ) {
     loop {
@@ -126,20 +125,21 @@ pub async fn dh_reader(
         match packet.body {
             PTCPBody::Status(realm, status) => {
                 if status == "CONN" {
-                    conn_channels
-                        .lock()
-                        .unwrap()
-                        .remove(&realm)
-                        .unwrap()
-                        .send(true)
-                        .unwrap();
+                    if let Some(tx) = conn_channels.lock().unwrap().remove(&realm) {
+                        let _ = tx.send(true);
+                    }
+                } else if status == "DISC" {
+                    channels.lock().unwrap().remove(&realm);
                 }
             }
             PTCPBody::Payload(p) => {
-                let tx = channels.lock().unwrap().get(&p.realm).unwrap().clone();
-
-                if tx.send(p.data).await.is_err() {
-                    println!("Realm {:08x} unavailable", p.realm);
+                // Never block here: this task ACKs packets for every realm, so a
+                // slow or closed client must not stall the whole P2P session.
+                let mut map = channels.lock().unwrap();
+                if let Some(tx) = map.get(&p.realm) {
+                    if tx.send(p.data).is_err() {
+                        map.remove(&p.realm);
+                    }
                 }
             }
             _ => {}
