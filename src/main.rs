@@ -68,7 +68,9 @@ async fn main() {
     let (dh_tx, dh_rx) = mpsc::channel::<PTCPEvent>(128);
     let session = Arc::new(Mutex::new(session));
 
-    let channels = Arc::new(Mutex::new(HashMap::<u32, mpsc::UnboundedSender<Vec<u8>>>::new()));
+    let channels = Arc::new(Mutex::new(
+        HashMap::<u32, mpsc::UnboundedSender<Vec<u8>>>::new(),
+    ));
     let conn_channels = Arc::new(Mutex::new(HashMap::<u32, oneshot::Sender<bool>>::new()));
 
     println!("PTCP session established");

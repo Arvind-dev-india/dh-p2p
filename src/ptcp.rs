@@ -233,6 +233,8 @@ impl PTCPPacket {
 pub struct PTCPSession {
     sent: u32,
     recv: u32,
+    // Packets that arrived ahead of `recv`, keyed by their stream offset.
+    pending: std::collections::BTreeMap<u32, PTCPPacket>,
     count: u32,
     id: u32,
     rmid: u32,
@@ -243,6 +245,7 @@ impl PTCPSession {
         PTCPSession {
             sent: 0,
             recv: 0,
+            pending: std::collections::BTreeMap::new(),
             count: 0,
             id: 0,
             rmid: 0,
@@ -281,11 +284,48 @@ impl PTCPSession {
         }
     }
 
+    /// Accept a packet from the device and return the packets that are now
+    /// deliverable in stream order. UDP may duplicate, reorder or drop packets;
+    /// counting every packet (as upstream did) desyncs the ACK offset and the
+    /// device eventually tears the session down.
+    /// Handshake-time receive (strictly sequential request/response).
     pub fn recv(&mut self, packet: PTCPPacket) -> PTCPPacket {
-        self.recv += packet.body.len() as u32;
+        self.recv = self.recv.wrapping_add(packet.body.len() as u32);
+        self.rmid = packet.lmid;
+        packet
+    }
+
+    pub fn recv_ordered(&mut self, packet: PTCPPacket) -> Vec<PTCPPacket> {
         self.rmid = packet.lmid;
 
-        packet
+        if packet.body.len() == 0 {
+            return vec![packet];
+        }
+
+        let ahead = packet.sent.wrapping_sub(self.recv);
+        if ahead == 0 {
+            // in order
+        } else if ahead < 0x8000_0000 {
+            if self.pending.len() < 4096 {
+                self.pending.entry(packet.sent).or_insert(packet);
+            }
+            return Vec::new();
+        } else {
+            return Vec::new(); // duplicate of already-delivered data
+        }
+
+        let mut out = Vec::new();
+        self.recv = self.recv.wrapping_add(packet.body.len() as u32);
+        out.push(packet);
+        while let Some(next) = self.pending.remove(&self.recv) {
+            self.recv = self.recv.wrapping_add(next.body.len() as u32);
+            out.push(next);
+        }
+        // Drop anything now stale.
+        let recv = self.recv;
+        self.pending
+            .retain(|k, _| k.wrapping_sub(recv) < 0x8000_0000);
+        out
     }
 }
 

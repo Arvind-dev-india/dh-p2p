@@ -113,36 +113,39 @@ pub async fn dh_reader(
 ) {
     loop {
         let packet = socket.ptcp_read().await;
-        let packet = session.lock().unwrap().recv(packet);
+        let packets = session.lock().unwrap().recv_ordered(packet);
 
-        if let PTCPBody::Empty = packet.body {
-            continue;
+        // Always ACK (with the current in-order offset) so the device can
+        // retransmit anything we are missing.
+        let needs_ack = packets.iter().all(|p| !matches!(p.body, PTCPBody::Empty));
+        if needs_ack {
+            let p = session.lock().unwrap().send(PTCPBody::Empty);
+            socket.ptcp_request(p).await;
         }
 
-        let p = session.lock().unwrap().send(PTCPBody::Empty);
-        socket.ptcp_request(p).await;
-
-        match packet.body {
-            PTCPBody::Status(realm, status) => {
-                if status == "CONN" {
-                    if let Some(tx) = conn_channels.lock().unwrap().remove(&realm) {
-                        let _ = tx.send(true);
-                    }
-                } else if status == "DISC" {
-                    channels.lock().unwrap().remove(&realm);
-                }
-            }
-            PTCPBody::Payload(p) => {
-                // Never block here: this task ACKs packets for every realm, so a
-                // slow or closed client must not stall the whole P2P session.
-                let mut map = channels.lock().unwrap();
-                if let Some(tx) = map.get(&p.realm) {
-                    if tx.send(p.data).is_err() {
-                        map.remove(&p.realm);
+        for packet in packets {
+            match packet.body {
+                PTCPBody::Status(realm, status) => {
+                    if status == "CONN" {
+                        if let Some(tx) = conn_channels.lock().unwrap().remove(&realm) {
+                            let _ = tx.send(true);
+                        }
+                    } else if status == "DISC" {
+                        channels.lock().unwrap().remove(&realm);
                     }
                 }
+                PTCPBody::Payload(p) => {
+                    // Never block here: this task ACKs packets for every realm, so a
+                    // slow or closed client must not stall the whole P2P session.
+                    let mut map = channels.lock().unwrap();
+                    if let Some(tx) = map.get(&p.realm) {
+                        if tx.send(p.data).is_err() {
+                            map.remove(&p.realm);
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 }
